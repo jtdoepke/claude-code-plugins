@@ -8,8 +8,7 @@
     {
       "name": "obsidian-skills",
       "source": "./plugins/obsidian-skills",
-      "description": "Skills for managing an Obsidian vault - bases, plans, and research notes",
-      "version": "0.1.0"
+      "description": "Skills for managing an Obsidian vault - bases, plans, and research notes"
     }
   ]
 }

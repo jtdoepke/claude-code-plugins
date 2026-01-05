@@ -76,8 +76,7 @@ Skills can include:
 
 ### Version Management
 
-- Bump version in `plugins/<name>/.claude-plugin/plugin.json` to trigger a release
-- CI creates GitHub releases automatically when plugin.json version changes on main
+- Track version only in `plugins/<name>/.claude-plugin/plugin.json`
 
 ## CI/CD
 
@@ -85,6 +84,3 @@ On every push/PR:
 - ShellCheck linting on all scripts in `plugins/`
 - Bats tests for obsidian-skills
 - JSON validation for all .json files
-
-On version bump (plugin.json change on main):
-- Automatic GitHub release with auto-generated notes
