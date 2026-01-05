@@ -1,0 +1,10 @@
+{
+  "name": "obsidian-skills",
+  "description": "Skills for managing an Obsidian vault.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Jaye Doepke",
+    "url": "https://github.com/jtdoepke"
+  },
+  "repository": "https://github.com/jtdoepke/claude-code-plugins"
+}
