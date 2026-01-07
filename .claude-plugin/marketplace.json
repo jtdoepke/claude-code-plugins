@@ -9,6 +9,11 @@
       "name": "obsidian-skills",
       "source": "./plugins/obsidian-skills",
       "description": "Skills for managing an Obsidian vault - bases, plans, and research notes"
+    },
+    {
+      "name": "code-review",
+      "source": "./plugins/code-review",
+      "description": "Multi-agent code review for GitHub PRs, GitLab MRs, and local git changes"
     }
   ]
 }

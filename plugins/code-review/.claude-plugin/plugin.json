@@ -1,0 +1,10 @@
+{
+  "name": "code-review",
+  "description": "Multi-agent code review for GitHub PRs, GitLab MRs, and local git changes.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Jaye Doepke",
+    "url": "https://github.com/jtdoepke"
+  },
+  "repository": "https://github.com/jtdoepke/claude-code-plugins"
+}
