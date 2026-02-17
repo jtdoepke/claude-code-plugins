@@ -1,0 +1,1761 @@
+#!/usr/bin/env bash
+# tmux-cli: Interact with CLI applications in tmux panes/windows.
+#
+# Bash port of the tmux-cli plugin from pchalasani/claude-code-tools.
+# Original by Prasad Chalasani (MIT License). See LICENSE-UPSTREAM.
+#
+# Usage: tmux-cli <command> [options]
+#
+# Auto-detects tmux environment:
+#   - Inside tmux:  manages panes in the current window  (local mode)
+#   - Outside tmux: manages windows in a dedicated session (remote mode)
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Globals
+# ---------------------------------------------------------------------------
+MODE=""               # "local" or "remote"
+TARGET_PANE=""        # last-used pane ID (local mode)
+TARGET_WINDOW=""      # last-used window target (remote mode)
+SESSION_NAME=""       # remote session name
+TMUX_RC=0             # exit code of last tmux command
+TMUX_OUT=""           # stdout of last tmux command
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+# Run a tmux command, capturing stdout into TMUX_OUT and exit code into TMUX_RC.
+run_tmux() {
+    TMUX_OUT=""
+    TMUX_RC=0
+    TMUX_OUT="$(tmux "$@" 2>/dev/null)" || TMUX_RC=$?
+    # Strip trailing whitespace/newlines
+    TMUX_OUT="${TMUX_OUT%"${TMUX_OUT##*[![:space:]]}"}"
+}
+
+# Escape a string for embedding in a JSON value.
+# Handles all characters that must be escaped per RFC 8259:
+# - Backslash, double quote
+# - Control characters U+0000 through U+001F
+# - ANSI escape sequences are stripped (no semantic value in JSON)
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"      # backslash (must be first)
+    s="${s//\"/\\\"}"      # double quote
+    # Strip ANSI escape sequences before escaping control chars.
+    # CSI sequences: ESC [ ... <letter>
+    # OSC sequences: ESC ] ... BEL
+    # Simple ESC sequences: ESC <char>
+    s="$(printf '%s' "$s" | sed -e $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' -e $'s/\x1b\\][^\x07]*\x07//g' -e $'s/\x1b[^[]\\?//g')"
+    s="${s//$'\n'/\\n}"    # newline  (U+000A)
+    s="${s//$'\r'/\\r}"    # carriage return (U+000D)
+    s="${s//$'\t'/\\t}"    # tab (U+0009)
+    s="${s//$'\b'/\\b}"    # backspace (U+0008)
+    s="${s//$'\f'/\\f}"    # form feed (U+000C)
+    # Escape any remaining control characters (U+0000-U+001F) as \uXXXX.
+    # At this point \n \r \t \b \f are already replaced, so only rare
+    # control chars remain (U+0000-U+0007, U+000B, U+000E-U+001F).
+    if [[ "$s" =~ [[:cntrl:]] ]]; then
+        local out="" i ch ord hex
+        for (( i=0; i<${#s}; i++ )); do
+            ch="${s:i:1}"
+            if [[ "$ch" =~ [[:cntrl:]] ]]; then
+                printf -v ord '%d' "'$ch"
+                printf -v hex '\\u%04x' "$ord"
+                out+="$hex"
+            else
+                out+="$ch"
+            fi
+        done
+        s="$out"
+    fi
+    printf '%s' "$s"
+}
+
+# Parse a boolean value (True/False/true/false/1/0) -> return 0 (true) or 1 (false).
+parse_bool() {
+    case "${1,,}" in
+        true|1|yes) return 0 ;;
+        false|0|no) return 1 ;;
+        *) echo "Error: invalid boolean value: $1" >&2; return 2 ;;
+    esac
+}
+
+# Parse delay_enter which can be a bool or a float.
+# Sets DELAY_ENTER_ENABLED (0/1) and DELAY_ENTER_SECS (float).
+parse_delay_enter() {
+    local val="$1"
+    DELAY_ENTER_ENABLED=1
+    DELAY_ENTER_SECS="1.5"
+
+    case "${val,,}" in
+        true|1|yes)
+            DELAY_ENTER_ENABLED=1
+            DELAY_ENTER_SECS="1.5"
+            ;;
+        false|0|no)
+            DELAY_ENTER_ENABLED=0
+            DELAY_ENTER_SECS="0"
+            ;;
+        *)
+            # Assume it's a float
+            if [[ "$val" =~ ^[0-9]*\.?[0-9]+$ ]]; then
+                DELAY_ENTER_ENABLED=1
+                DELAY_ENTER_SECS="$val"
+            else
+                echo "Error: invalid delay_enter value: $val" >&2
+                return 1
+            fi
+            ;;
+    esac
+}
+
+# Float comparison: return 0 if $1 >= $2
+float_ge() {
+    awk "BEGIN {exit !($1 >= $2)}"
+}
+
+# Detect whether we are inside tmux and set MODE accordingly.
+detect_mode() {
+    if [[ -n "${TMUX:-}" ]]; then
+        MODE="local"
+    else
+        MODE="remote"
+        SESSION_NAME="${SESSION_NAME:-remote-cli-session}"
+        echo "Note: tmux-cli is running outside tmux. Managing windows in session '${SESSION_NAME}'."
+        echo "For better integration, consider running from inside a tmux session."
+        echo "Use 'tmux-cli attach' to view the remote session."
+        remote_ensure_session
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Local Mode (pane-based, inside tmux)
+# ---------------------------------------------------------------------------
+
+local_get_current_session() {
+    run_tmux display-message -p '#{session_name}'
+    [[ $TMUX_RC -eq 0 ]] && printf '%s' "$TMUX_OUT" || return 1
+}
+
+local_get_current_window() {
+    run_tmux display-message -p '#{window_name}'
+    [[ $TMUX_RC -eq 0 ]] && printf '%s' "$TMUX_OUT" || return 1
+}
+
+local_get_current_pane() {
+    run_tmux display-message -p '#{pane_id}'
+    [[ $TMUX_RC -eq 0 ]] && printf '%s' "$TMUX_OUT" || return 1
+}
+
+local_get_current_pane_index() {
+    run_tmux display-message -p '#{pane_index}'
+    [[ $TMUX_RC -eq 0 ]] && printf '%s' "$TMUX_OUT" || return 1
+}
+
+local_get_current_window_id() {
+    local current_pane="${TMUX_PANE:-}"
+    if [[ -n "$current_pane" ]]; then
+        run_tmux display-message -t "$current_pane" -p '#{window_id}'
+        [[ $TMUX_RC -eq 0 ]] && printf '%s' "$TMUX_OUT" && return 0
+    fi
+    run_tmux display-message -p '#{window_id}'
+    [[ $TMUX_RC -eq 0 ]] && printf '%s' "$TMUX_OUT" || return 1
+}
+
+# Convert a pane ID (e.g. %123) to session:window.pane format.
+local_format_pane_id() {
+    local pane_id="$1"
+    [[ -z "$pane_id" ]] && printf '%s' "$pane_id" && return
+
+    local session_name window_index pane_index
+
+    run_tmux display-message -t "$pane_id" -p '#{session_name}'
+    [[ $TMUX_RC -ne 0 || -z "$TMUX_OUT" ]] && printf '%s' "$pane_id" && return
+    session_name="$TMUX_OUT"
+
+    run_tmux display-message -t "$pane_id" -p '#{window_index}'
+    [[ $TMUX_RC -ne 0 || -z "$TMUX_OUT" ]] && printf '%s' "$pane_id" && return
+    window_index="$TMUX_OUT"
+
+    run_tmux display-message -t "$pane_id" -p '#{pane_index}'
+    [[ $TMUX_RC -ne 0 || -z "$TMUX_OUT" ]] && printf '%s' "$pane_id" && return
+    pane_index="$TMUX_OUT"
+
+    printf '%s:%s.%s' "$session_name" "$window_index" "$pane_index"
+}
+
+# Resolve various pane identifier formats to a pane ID (%NNN).
+local_resolve_pane() {
+    local identifier="$1"
+    [[ -z "$identifier" ]] && return 1
+
+    # Already a pane ID
+    if [[ "$identifier" == %* ]]; then
+        printf '%s' "$identifier"
+        return 0
+    fi
+
+    # Just a number -> pane index in current window
+    if [[ "$identifier" =~ ^[0-9]+$ ]]; then
+        local window_id
+        window_id="$(local_get_current_window_id)" || return 1
+        local target="${window_id}"
+        run_tmux list-panes -t "$target" -F '#{pane_id}|#{pane_index}'
+        [[ $TMUX_RC -ne 0 ]] && return 1
+        local line
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            local pid="${line%%|*}"
+            local pidx="${line##*|}"
+            if [[ "$pidx" == "$identifier" ]]; then
+                printf '%s' "$pid"
+                return 0
+            fi
+        done <<< "$TMUX_OUT"
+        return 1
+    fi
+
+    # session:window.pane format
+    if [[ "$identifier" == *:*.* ]]; then
+        run_tmux display-message -t "$identifier" -p '#{pane_id}'
+        if [[ $TMUX_RC -eq 0 && -n "$TMUX_OUT" ]]; then
+            printf '%s' "$TMUX_OUT"
+            return 0
+        fi
+        return 1
+    fi
+
+    return 1
+}
+
+# List panes in the current window as JSON.
+local_list_panes() {
+    local target
+    target="$(local_get_current_window_id)" || target=""
+
+    if [[ -n "$target" ]]; then
+        run_tmux list-panes -t "$target" \
+            -F '#{pane_id}|#{pane_index}|#{pane_title}|#{pane_active}|#{pane_width}x#{pane_height}|#{pane_current_command}'
+    else
+        run_tmux list-panes \
+            -F '#{pane_id}|#{pane_index}|#{pane_title}|#{pane_active}|#{pane_width}x#{pane_height}|#{pane_current_command}'
+    fi
+
+    [[ $TMUX_RC -ne 0 ]] && echo "[]" && return
+
+    local first=1
+    printf '['
+    local line
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        IFS='|' read -r pid pidx ptitle pactive psize pcmd <<< "$line"
+        local formatted_id
+        formatted_id="$(local_format_pane_id "$pid")"
+
+        local active_bool="false"
+        [[ "$pactive" == "1" ]] && active_bool="true"
+
+        [[ $first -eq 0 ]] && printf ','
+        first=0
+
+        printf '{"id":"%s","index":"%s","title":"%s","active":%s,"size":"%s","command":"%s","formatted_id":"%s"}' \
+            "$(json_escape "$pid")" \
+            "$(json_escape "$pidx")" \
+            "$(json_escape "$ptitle")" \
+            "$active_bool" \
+            "$(json_escape "$psize")" \
+            "$(json_escape "$pcmd")" \
+            "$(json_escape "$formatted_id")"
+    done <<< "$TMUX_OUT"
+    printf ']\n'
+}
+
+# Create a new pane. Prints the pane ID on success.
+local_create_pane() {
+    local vertical=1 size="" start_command=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --horizontal) vertical=0; shift ;;
+            --vertical)   vertical=1; shift ;;
+            --size=*)     size="${1#--size=}"; shift ;;
+            *)            start_command="$1"; shift ;;
+        esac
+    done
+
+    local window_id
+    window_id="$(local_get_current_window_id)" || window_id=""
+
+    # Collect existing pane IDs for later verification
+    local existing_panes=""
+    if [[ -n "$window_id" ]]; then
+        run_tmux list-panes -t "$window_id" -F '#{pane_id}'
+        [[ $TMUX_RC -eq 0 ]] && existing_panes="$TMUX_OUT"
+    fi
+
+    local base_args=("split-window")
+    [[ -n "$window_id" ]] && base_args+=("-t" "$window_id")
+    [[ $vertical -eq 1 ]] && base_args+=("-h") || base_args+=("-v")
+
+    # Try -l first (tmux 3.4+), fall back to -p (older versions)
+    local size_variants=("")
+    if [[ -n "$size" ]]; then
+        size_variants=("-l ${size}%" "-p ${size}")
+    fi
+
+    local variant
+    for variant in "${size_variants[@]}"; do
+        local cmd=("${base_args[@]}")
+        if [[ -n "$variant" ]]; then
+            # shellcheck disable=SC2206
+            cmd+=($variant)
+        fi
+        cmd+=("-P" "-F" "#{pane_id}")
+        [[ -n "$start_command" ]] && cmd+=("$start_command")
+
+        run_tmux "${cmd[@]}"
+
+        if [[ $TMUX_RC -eq 0 && -n "$TMUX_OUT" && "$TMUX_OUT" == %* ]]; then
+            local new_pane="$TMUX_OUT"
+
+            # Verify the pane actually exists
+            run_tmux display-message -t "$new_pane" -p '#{pane_id}'
+            if [[ $TMUX_RC -eq 0 && "$TMUX_OUT" == "$new_pane" ]]; then
+                TARGET_PANE="$new_pane"
+                printf '%s' "$new_pane"
+                return 0
+            fi
+
+            # Fallback: find the actual new pane by diffing
+            if [[ -n "$window_id" ]]; then
+                run_tmux list-panes -t "$window_id" -F '#{pane_id}'
+                if [[ $TMUX_RC -eq 0 ]]; then
+                    local current_panes="$TMUX_OUT"
+                    local p
+                    while IFS= read -r p; do
+                        [[ -z "$p" ]] && continue
+                        if ! grep -qxF "$p" <<< "$existing_panes" 2>/dev/null; then
+                            TARGET_PANE="$p"
+                            printf '%s' "$p"
+                            return 0
+                        fi
+                    done <<< "$current_panes"
+                fi
+            fi
+        fi
+    done
+
+    return 1
+}
+
+# Send keys to a pane with optional Enter key and delay/verification.
+local_send_keys() {
+    local text="" target="${TARGET_PANE}" enter=1 delay_enter_val="True" max_retries=3
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --pane=*)          target="${1#--pane=}"; shift ;;
+            --enter=*)         parse_bool "${1#--enter=}" && enter=1 || enter=0; shift ;;
+            --delay-enter=*|--delay_enter=*)
+                               delay_enter_val="${1#*=}"; shift ;;
+            --max-retries=*|--max_retries=*)
+                               max_retries="${1#*=}"; shift ;;
+            *)                 if [[ -z "$text" ]]; then text="$1"; fi; shift ;;
+        esac
+    done
+
+    [[ -z "$target" ]] && echo "Error: No target pane specified" >&2 && return 1
+
+    parse_delay_enter "$delay_enter_val"
+
+    if [[ $enter -eq 1 && $DELAY_ENTER_ENABLED -eq 1 ]]; then
+        # Send text without Enter first
+        run_tmux send-keys -t "$target" "$text"
+
+        # Apply delay
+        sleep "$DELAY_ENTER_SECS"
+
+        # Capture pane state BEFORE Enter for verification
+        local content_before
+        content_before="$(local_capture_pane --pane="$target" --lines=20)"
+
+        # Send Enter with retry
+        local_send_enter_with_retry "$target" "$content_before" "$max_retries"
+    else
+        if [[ $enter -eq 1 ]]; then
+            run_tmux send-keys -t "$target" "$text" Enter
+        else
+            run_tmux send-keys -t "$target" "$text"
+        fi
+    fi
+}
+
+# Send Enter key with verification and exponential backoff retry.
+local_send_enter_with_retry() {
+    local target="$1"
+    local content_before="$2"
+    local max_retries="${3:-3}"
+
+    local attempt
+    for ((attempt = 0; attempt < max_retries; attempt++)); do
+        run_tmux send-keys -t "$target" Enter
+
+        [[ -z "$content_before" ]] && return 0
+
+        sleep 0.3
+
+        local content_after
+        content_after="$(local_capture_pane --pane="$target" --lines=20)"
+
+        if [[ "$content_after" != "$content_before" ]]; then
+            return 0
+        fi
+
+        if ((attempt < max_retries - 1)); then
+            local backoff
+            backoff="$(awk "BEGIN {printf \"%.1f\", 0.5 * ($attempt + 1)}")"
+            sleep "$backoff"
+        fi
+    done
+}
+
+# Capture pane contents.
+local_capture_pane() {
+    local target="${TARGET_PANE}" lines=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --pane=*)  target="${1#--pane=}"; shift ;;
+            --lines=*) lines="${1#--lines=}"; shift ;;
+            *)         shift ;;
+        esac
+    done
+
+    [[ -z "$target" ]] && echo "Error: No target pane specified" >&2 && return 1
+
+    local args=(capture-pane -t "$target" -p)
+    [[ -n "$lines" ]] && args+=(-S "-${lines}")
+
+    run_tmux "${args[@]}"
+    printf '%s' "$TMUX_OUT"
+}
+
+# Wait for pane to become idle (no output changes for idle_time seconds).
+local_wait_for_idle() {
+    local target="${TARGET_PANE}" idle_time="2.0" check_interval="0.5" timeout=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --pane=*)           target="${1#--pane=}"; shift ;;
+            --idle-time=*|--idle_time=*)
+                                idle_time="${1#*=}"; shift ;;
+            --check-interval=*|--check_interval=*)
+                                check_interval="${1#*=}"; shift ;;
+            --timeout=*)        timeout="${1#--timeout=}"; shift ;;
+            *)                  shift ;;
+        esac
+    done
+
+    [[ -z "$target" ]] && echo "Error: No target pane specified" >&2 && return 1
+
+    local start_time last_change_time last_hash="" now elapsed_idle elapsed_total
+    start_time="$(date +%s.%N)"
+    last_change_time="$start_time"
+
+    while true; do
+        now="$(date +%s.%N)"
+
+        if [[ -n "$timeout" ]]; then
+            elapsed_total="$(awk "BEGIN {printf \"%.3f\", $now - $start_time}")"
+            if float_ge "$elapsed_total" "$timeout"; then
+                return 1
+            fi
+        fi
+
+        local content
+        content="$(local_capture_pane --pane="$target")"
+        local content_hash
+        content_hash="$(printf '%s' "$content" | md5sum | cut -d' ' -f1)"
+
+        if [[ "$content_hash" != "$last_hash" ]]; then
+            last_hash="$content_hash"
+            last_change_time="$now"
+        else
+            elapsed_idle="$(awk "BEGIN {printf \"%.3f\", $now - $last_change_time}")"
+            if float_ge "$elapsed_idle" "$idle_time"; then
+                return 0
+            fi
+        fi
+
+        sleep "$check_interval"
+    done
+}
+
+# Kill a pane (with safety check against own pane).
+# shellcheck disable=SC2120
+local_kill_pane() {
+    local target="${TARGET_PANE}" explicit=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --pane=*) target="${1#--pane=}"; explicit=1; shift ;;
+            *)        shift ;;
+        esac
+    done
+
+    [[ -z "$target" ]] && echo "Error: No target pane specified" >&2 && return 1
+
+    # Safety check when pane was explicitly specified
+    if [[ $explicit -eq 1 ]]; then
+        local current_pane
+        current_pane="$(local_get_current_pane)" || true
+        if [[ -n "$current_pane" && "$target" == "$current_pane" ]]; then
+            echo "Error: Cannot kill own pane! This would terminate your session." >&2
+            return 1
+        fi
+    fi
+
+    run_tmux kill-pane -t "$target"
+    [[ "$target" == "$TARGET_PANE" ]] && TARGET_PANE=""
+}
+
+# shellcheck disable=SC2120
+local_send_interrupt() {
+    local target="${TARGET_PANE}"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in --pane=*) target="${1#--pane=}"; shift ;; *) shift ;; esac
+    done
+    [[ -z "$target" ]] && echo "Error: No target pane specified" >&2 && return 1
+    run_tmux send-keys -t "$target" C-c
+}
+
+# shellcheck disable=SC2120
+local_send_escape() {
+    local target="${TARGET_PANE}"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in --pane=*) target="${1#--pane=}"; shift ;; *) shift ;; esac
+    done
+    [[ -z "$target" ]] && echo "Error: No target pane specified" >&2 && return 1
+    run_tmux send-keys -t "$target" Escape
+}
+
+# Resize a pane.
+local_resize_pane() {
+    local target="${TARGET_PANE}" direction="" amount=5
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --pane=*)      target="${1#--pane=}"; shift ;;
+            --direction=*) direction="${1#--direction=}"; shift ;;
+            --amount=*)    amount="${1#--amount=}"; shift ;;
+            *)             shift ;;
+        esac
+    done
+    [[ -z "$target" ]] && echo "Error: No target pane specified" >&2 && return 1
+    [[ -z "$direction" ]] && echo "Error: No direction specified" >&2 && return 1
+
+    local flag
+    case "$direction" in
+        up)    flag="-U" ;;
+        down)  flag="-D" ;;
+        left)  flag="-L" ;;
+        right) flag="-R" ;;
+        *)     echo "Error: Invalid direction: $direction (use up/down/left/right)" >&2; return 1 ;;
+    esac
+
+    run_tmux resize-pane -t "$target" "$flag" "$amount"
+}
+
+# Focus/select a pane.
+# shellcheck disable=SC2120
+local_focus_pane() {
+    local target="${TARGET_PANE}"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in --pane=*) target="${1#--pane=}"; shift ;; *) shift ;; esac
+    done
+    [[ -z "$target" ]] && echo "Error: No target pane specified" >&2 && return 1
+    run_tmux select-pane -t "$target"
+}
+
+# Clear a pane screen (sends Ctrl+L).
+# shellcheck disable=SC2120
+local_clear_pane() {
+    local target="${TARGET_PANE}"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in --pane=*) target="${1#--pane=}"; shift ;; *) shift ;; esac
+    done
+    [[ -z "$target" ]] && echo "Error: No target pane specified" >&2 && return 1
+    run_tmux send-keys -t "$target" C-l
+}
+
+# Wait for a regex pattern to appear in pane output.
+local_wait_for_prompt() {
+    local target="${TARGET_PANE}" pattern="" timeout=10 interval="0.5" lines=50
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --pane=*)     target="${1#--pane=}"; shift ;;
+            --timeout=*)  timeout="${1#--timeout=}"; shift ;;
+            --interval=*) interval="${1#--interval=}"; shift ;;
+            --lines=*)    lines="${1#--lines=}"; shift ;;
+            *)            if [[ -z "$pattern" ]]; then pattern="$1"; fi; shift ;;
+        esac
+    done
+    [[ -z "$target" ]] && echo "Error: No target pane specified" >&2 && return 1
+    [[ -z "$pattern" ]] && echo "Error: No prompt pattern specified" >&2 && return 1
+
+    local deadline
+    deadline=$(( $(date +%s) + timeout ))
+
+    while [[ $(date +%s) -lt $deadline ]]; do
+        run_tmux capture-pane -t "$target" -p -S "-${lines}"
+        if printf '%s' "$TMUX_OUT" | grep -qE "$pattern"; then
+            return 0
+        fi
+        sleep "$interval"
+    done
+    return 1
+}
+
+# Execute a command with marker-based exit code capture.
+local_execute() {
+    local command="" target="${TARGET_PANE}" timeout=30
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --pane=*)    target="${1#--pane=}"; shift ;;
+            --timeout=*) timeout="${1#--timeout=}"; shift ;;
+            *)           if [[ -z "$command" ]]; then command="$1"; fi; shift ;;
+        esac
+    done
+
+    [[ -z "$target" ]] && echo "Error: No target pane specified" >&2 && return 1
+    [[ -z "$command" ]] && echo "Error: No command specified" >&2 && return 1
+
+    local start_marker end_marker
+    generate_execution_markers
+    # start_marker and end_marker set by generate_execution_markers
+
+    local wrapped
+    wrapped="$(wrap_command_with_markers "$command" "$START_MARKER" "$END_MARKER")"
+
+    # Send with delay_enter=False so we don't delay
+    local old_target="$TARGET_PANE"
+    TARGET_PANE="$target"
+    local_send_keys "$wrapped" --enter=True --delay-enter=False
+    TARGET_PANE="$old_target"
+
+    # Poll for completion
+    poll_for_completion "local" "$target" "$START_MARKER" "$END_MARKER" "$timeout"
+}
+
+# Launch a CLI in a new pane. Prints the formatted pane ID.
+local_launch_cli() {
+    local command="" vertical=1 size=50
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --vertical)      vertical=1; shift ;;
+            --horizontal)    vertical=0; shift ;;
+            --size=*)        size="${1#--size=}"; shift ;;
+            *)               if [[ -z "$command" ]]; then command="$1"; fi; shift ;;
+        esac
+    done
+
+    local args=()
+    [[ $vertical -eq 1 ]] && args+=("--vertical") || args+=("--horizontal")
+    args+=("--size=$size")
+    [[ -n "$command" ]] && args+=("$command")
+
+    local pane_id
+    pane_id="$(local_create_pane "${args[@]}")" || return 1
+
+    local formatted
+    formatted="$(local_format_pane_id "$pane_id")"
+    printf '%s' "$formatted"
+}
+
+# ---------------------------------------------------------------------------
+# Remote Mode (window-based, outside tmux)
+# ---------------------------------------------------------------------------
+
+remote_ensure_session() {
+    run_tmux has-session -t "$SESSION_NAME"
+    if [[ $TMUX_RC -ne 0 ]]; then
+        run_tmux new-session -d -s "$SESSION_NAME" -P -F '#{session_name}'
+        TARGET_WINDOW="${SESSION_NAME}:0"
+    else
+        if [[ -z "$TARGET_WINDOW" ]]; then
+            run_tmux display-message -p -t "$SESSION_NAME" '#{session_name}:#{window_index}'
+            [[ $TMUX_RC -eq 0 && -n "$TMUX_OUT" ]] && TARGET_WINDOW="$TMUX_OUT"
+        fi
+    fi
+}
+
+# Resolve user-provided pane hint to a tmux target.
+remote_window_target() {
+    local pane="${1:-}"
+    remote_ensure_session
+
+    if [[ -z "$pane" ]]; then
+        if [[ -n "$TARGET_WINDOW" ]]; then
+            printf '%s' "$TARGET_WINDOW"
+            return
+        fi
+        run_tmux display-message -p -t "$SESSION_NAME" '#{session_name}:#{window_index}'
+        if [[ $TMUX_RC -eq 0 && -n "$TMUX_OUT" ]]; then
+            TARGET_WINDOW="$TMUX_OUT"
+            printf '%s' "$TARGET_WINDOW"
+            return
+        fi
+        printf '%s:0' "$SESSION_NAME"
+        return
+    fi
+
+    # Simple index
+    if [[ "$pane" =~ ^[0-9]+$ ]]; then
+        printf '%s:%s' "$SESSION_NAME" "$pane"
+        return
+    fi
+
+    # Pass through anything else
+    printf '%s' "$pane"
+}
+
+# List panes (actually windows) in remote mode as JSON.
+remote_list_panes() {
+    remote_ensure_session
+    run_tmux list-windows -t "$SESSION_NAME" \
+        -F '#{window_index}|#{window_name}|#{window_active}|#{window_width}x#{window_height}'
+    [[ $TMUX_RC -ne 0 || -z "$TMUX_OUT" ]] && echo "[]" && return
+
+    local first=1
+    printf '['
+    local line
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        IFS='|' read -r widx wname wactive wsize <<< "$line"
+
+        local active_bool="false"
+        [[ "$wactive" == "1" ]] && active_bool="true"
+
+        [[ $first -eq 0 ]] && printf ','
+        first=0
+
+        printf '{"id":"%s:%s","index":"%s","title":"%s","active":%s,"size":"%s"}' \
+            "$(json_escape "$SESSION_NAME")" \
+            "$(json_escape "$widx")" \
+            "$(json_escape "$widx")" \
+            "$(json_escape "$wname")" \
+            "$active_bool" \
+            "$(json_escape "$wsize")"
+    done <<< "$TMUX_OUT"
+    printf ']\n'
+}
+
+# Launch a command in a new window.
+remote_launch_cli() {
+    local command="" name=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name=*) name="${1#--name=}"; shift ;;
+            *)        if [[ -z "$command" ]]; then command="$1"; fi; shift ;;
+        esac
+    done
+
+    remote_ensure_session
+    local args=(new-window -t "$SESSION_NAME" -P -F '#{session_name}:#{window_index}')
+    [[ -n "$name" ]] && args+=(-n "$name")
+    [[ -n "$command" ]] && args+=("$command")
+
+    run_tmux "${args[@]}"
+    if [[ $TMUX_RC -eq 0 && -n "$TMUX_OUT" ]]; then
+        TARGET_WINDOW="$TMUX_OUT"
+        printf '%s' "$TMUX_OUT"
+        return 0
+    fi
+    return 1
+}
+
+remote_send_keys() {
+    local text="" pane_id="" enter=1 delay_enter_val="True" max_retries=3
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --pane=*)          pane_id="${1#--pane=}"; shift ;;
+            --enter=*)         parse_bool "${1#--enter=}" && enter=1 || enter=0; shift ;;
+            --delay-enter=*|--delay_enter=*)
+                               delay_enter_val="${1#*=}"; shift ;;
+            --max-retries=*|--max_retries=*)
+                               max_retries="${1#*=}"; shift ;;
+            *)                 if [[ -z "$text" ]]; then text="$1"; fi; shift ;;
+        esac
+    done
+
+    [[ -z "$text" ]] && return
+
+    local target
+    target="$(remote_window_target "$pane_id")"
+
+    parse_delay_enter "$delay_enter_val"
+
+    if [[ $enter -eq 1 && $DELAY_ENTER_ENABLED -eq 1 ]]; then
+        run_tmux send-keys -t "$target" "$text"
+        sleep "$DELAY_ENTER_SECS"
+
+        local content_before
+        content_before="$(remote_capture_pane --pane="$pane_id" --lines=20)"
+
+        remote_send_enter_with_retry "$target" "$pane_id" "$content_before" "$max_retries"
+    else
+        if [[ $enter -eq 1 ]]; then
+            run_tmux send-keys -t "$target" "$text" Enter
+        else
+            run_tmux send-keys -t "$target" "$text"
+        fi
+    fi
+}
+
+remote_send_enter_with_retry() {
+    local target="$1"
+    local pane_id="$2"
+    local content_before="$3"
+    local max_retries="${4:-3}"
+
+    local attempt
+    for ((attempt = 0; attempt < max_retries; attempt++)); do
+        run_tmux send-keys -t "$target" Enter
+
+        [[ -z "$content_before" ]] && return 0
+
+        sleep 0.3
+
+        local content_after
+        content_after="$(remote_capture_pane --pane="$pane_id" --lines=20)"
+
+        if [[ "$content_after" != "$content_before" ]]; then
+            return 0
+        fi
+
+        if ((attempt < max_retries - 1)); then
+            local backoff
+            backoff="$(awk "BEGIN {printf \"%.1f\", 0.5 * ($attempt + 1)}")"
+            sleep "$backoff"
+        fi
+    done
+}
+
+remote_capture_pane() {
+    local pane_id="" lines=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --pane=*)  pane_id="${1#--pane=}"; shift ;;
+            --lines=*) lines="${1#--lines=}"; shift ;;
+            *)         shift ;;
+        esac
+    done
+
+    local target
+    target="$(remote_window_target "$pane_id")"
+
+    local args=(capture-pane -t "$target" -p)
+    [[ -n "$lines" ]] && args+=(-S "-${lines}")
+
+    run_tmux "${args[@]}"
+    printf '%s' "$TMUX_OUT"
+}
+
+remote_wait_for_idle() {
+    local pane_id="" idle_time="2.0" check_interval="0.5" timeout=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --pane=*)           pane_id="${1#--pane=}"; shift ;;
+            --idle-time=*|--idle_time=*)
+                                idle_time="${1#*=}"; shift ;;
+            --check-interval=*|--check_interval=*)
+                                check_interval="${1#*=}"; shift ;;
+            --timeout=*)        timeout="${1#--timeout=}"; shift ;;
+            *)                  shift ;;
+        esac
+    done
+
+    local target
+    target="$(remote_window_target "$pane_id")"
+
+    local start_time last_change_time last_hash="" now elapsed_idle elapsed_total
+    start_time="$(date +%s.%N)"
+    last_change_time="$start_time"
+
+    while true; do
+        now="$(date +%s.%N)"
+
+        if [[ -n "$timeout" ]]; then
+            elapsed_total="$(awk "BEGIN {printf \"%.3f\", $now - $start_time}")"
+            if float_ge "$elapsed_total" "$timeout"; then
+                return 1
+            fi
+        fi
+
+        run_tmux capture-pane -t "$target" -p
+        local content_hash
+        content_hash="$(printf '%s' "$TMUX_OUT" | md5sum | cut -d' ' -f1)"
+
+        if [[ "$content_hash" != "$last_hash" ]]; then
+            last_hash="$content_hash"
+            last_change_time="$now"
+        else
+            elapsed_idle="$(awk "BEGIN {printf \"%.3f\", $now - $last_change_time}")"
+            if float_ge "$elapsed_idle" "$idle_time"; then
+                return 0
+            fi
+        fi
+
+        sleep "$check_interval"
+    done
+}
+
+remote_send_interrupt() {
+    local pane_id=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in --pane=*) pane_id="${1#--pane=}"; shift ;; *) shift ;; esac
+    done
+    local target
+    target="$(remote_window_target "$pane_id")"
+    run_tmux send-keys -t "$target" C-c
+}
+
+remote_send_escape() {
+    local pane_id=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in --pane=*) pane_id="${1#--pane=}"; shift ;; *) shift ;; esac
+    done
+    local target
+    target="$(remote_window_target "$pane_id")"
+    run_tmux send-keys -t "$target" Escape
+}
+
+remote_execute() {
+    local command="" pane_id="" timeout=30
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --pane=*)    pane_id="${1#--pane=}"; shift ;;
+            --timeout=*) timeout="${1#--timeout=}"; shift ;;
+            *)           if [[ -z "$command" ]]; then command="$1"; fi; shift ;;
+        esac
+    done
+
+    [[ -z "$command" ]] && echo "Error: No command specified" >&2 && return 1
+
+    generate_execution_markers
+
+    local wrapped
+    wrapped="$(wrap_command_with_markers "$command" "$START_MARKER" "$END_MARKER")"
+
+    remote_send_keys "$wrapped" --pane="$pane_id" --enter=True --delay-enter=False
+
+    poll_for_completion "remote" "$pane_id" "$START_MARKER" "$END_MARKER" "$timeout"
+}
+
+remote_kill_window() {
+    local window_id=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in --pane=*) window_id="${1#--pane=}"; shift ;; *) shift ;; esac
+    done
+    local target
+    target="$(remote_window_target "$window_id")"
+    run_tmux kill-window -t "$target"
+    [[ "$TARGET_WINDOW" == "$target" ]] && TARGET_WINDOW=""
+}
+
+remote_attach_session() {
+    remote_ensure_session
+    tmux attach-session -t "$SESSION_NAME"
+}
+
+remote_cleanup_session() {
+    run_tmux kill-session -t "$SESSION_NAME"
+    TARGET_WINDOW=""
+}
+
+remote_list_windows() {
+    remote_ensure_session
+    run_tmux list-windows -t "$SESSION_NAME" -F '#{window_index}|#{window_name}|#{window_active}'
+    [[ $TMUX_RC -ne 0 || -z "$TMUX_OUT" ]] && return
+
+    local line
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        IFS='|' read -r widx wname wactive <<< "$line"
+        local active_str=""
+        [[ "$wactive" == "1" ]] && active_str=" (active)"
+
+        # Get pane ID for the window
+        run_tmux display-message -p -t "${SESSION_NAME}:${widx}" '#{pane_id}'
+        local pane_out="${TMUX_OUT:-}"
+
+        printf '  %s: %s%s - pane %s\n' "$widx" "$wname" "$active_str" "$pane_out"
+    done <<< "$TMUX_OUT"
+}
+
+# ---------------------------------------------------------------------------
+# Execution Helpers (marker-based command execution)
+# ---------------------------------------------------------------------------
+
+START_MARKER=""
+END_MARKER=""
+
+# Generate unique execution markers.
+generate_execution_markers() {
+    local timestamp pid unique_id
+    timestamp="$(date +%s%N)"
+    pid="$$"
+    unique_id="${pid}_${timestamp}"
+
+    START_MARKER="__TMUX_EXEC_START_${unique_id}__"
+    END_MARKER="__TMUX_EXEC_END_${unique_id}__"
+}
+
+# Wrap a command with start/end markers to capture exit code.
+wrap_command_with_markers() {
+    local command="$1" start_marker="$2" end_marker="$3"
+    printf 'echo %s; { %s; } 2>&1; echo %s:$?' "$start_marker" "$command" "$end_marker"
+}
+
+# Check if markers are present in captured output.
+# Returns via globals: HAS_START, HAS_END
+find_markers_in_output() {
+    local captured="$1" start_marker="$2" end_marker="$3"
+    HAS_START=0
+    HAS_END=0
+    if [[ "$captured" == *"$start_marker"* ]]; then HAS_START=1; fi
+    if [[ "$captured" == *"${end_marker}:"* ]]; then HAS_END=1; fi
+}
+
+# Parse marked output to extract command output and exit code.
+# Prints JSON: {"output": "...", "exit_code": N}
+parse_marked_output() {
+    local captured="$1" start_marker="$2" end_marker="$3"
+
+    # Check for markers
+    if [[ "$captured" != *"$start_marker"* || "$captured" != *"$end_marker"* ]]; then
+        printf '{"output":"%s","exit_code":-1}\n' "$(json_escape "$captured")"
+        return
+    fi
+
+    # Find the ECHOED start marker (on its own line after a newline)
+    local start_idx=-1
+    local nl_marker=$'\n'"${start_marker}"
+    local temp="${captured%%"$nl_marker"*}"
+    if [[ ${#temp} -lt ${#captured} ]]; then
+        start_idx=$(( ${#temp} + 1 ))  # skip the newline
+    elif [[ "$captured" == "${start_marker}"* ]]; then
+        start_idx=0
+    else
+        # Last resort: first occurrence
+        temp="${captured%%"$start_marker"*}"
+        start_idx=${#temp}
+    fi
+
+    # Find the ECHOED end marker with numeric exit code using regex
+    local exit_code=-1
+    local end_idx=-1
+
+    if [[ "$captured" =~ ${end_marker}:([0-9]+) ]]; then
+        exit_code="${BASH_REMATCH[1]}"
+        # Find position of the match
+        local before_end="${captured%%"${end_marker}:${exit_code}"*}"
+        end_idx=${#before_end}
+    fi
+
+    if [[ $start_idx -eq -1 || $end_idx -eq -1 ]]; then
+        printf '{"output":"%s","exit_code":-1}\n' "$(json_escape "$captured")"
+        return
+    fi
+
+    # Extract output between markers
+    local output_start=$(( start_idx + ${#start_marker} ))
+
+    # Skip newline after start marker
+    if [[ $output_start -lt ${#captured} ]]; then
+        local char="${captured:$output_start:1}"
+        [[ "$char" == $'\n' ]] && output_start=$(( output_start + 1 ))
+    fi
+
+    local output="${captured:$output_start:$(( end_idx - output_start ))}"
+    # Strip trailing newlines
+    output="${output%$'\n'}"
+
+    printf '{"output":"%s","exit_code":%d}\n' "$(json_escape "$output")" "$exit_code"
+}
+
+# Poll for completion with progressive expansion.
+poll_for_completion() {
+    local mode="$1" pane_target="$2" start_marker="$3" end_marker="$4" timeout="${5:-30}"
+
+    local expansion_levels=(100 500 2000 "")  # "" means capture all
+    local start_time
+    start_time="$(date +%s.%N)"
+
+    while true; do
+        local now elapsed
+        now="$(date +%s.%N)"
+        elapsed="$(awk "BEGIN {printf \"%.3f\", $now - $start_time}")"
+        if float_ge "$elapsed" "$timeout"; then
+            break
+        fi
+
+        local lines captured
+        for lines in "${expansion_levels[@]}"; do
+            if [[ "$mode" == "local" ]]; then
+                if [[ -n "$lines" ]]; then
+                    captured="$(local_capture_pane --pane="$pane_target" --lines="$lines")"
+                else
+                    captured="$(local_capture_pane --pane="$pane_target")"
+                fi
+            else
+                if [[ -n "$lines" ]]; then
+                    captured="$(remote_capture_pane --pane="$pane_target" --lines="$lines")"
+                else
+                    captured="$(remote_capture_pane --pane="$pane_target")"
+                fi
+            fi
+
+            find_markers_in_output "$captured" "$start_marker" "$end_marker"
+
+            if [[ $HAS_END -eq 1 ]]; then
+                if [[ $HAS_START -eq 1 ]]; then
+                    parse_marked_output "$captured" "$start_marker" "$end_marker"
+                    return 0
+                fi
+                # End found but start missing - try more lines
+                continue
+            else
+                # End not found yet - command still running
+                break
+            fi
+        done
+
+        sleep 0.5
+    done
+
+    # Timeout - capture with full expansion
+    local captured=""
+    local lines
+    for lines in "${expansion_levels[@]}"; do
+        if [[ "$mode" == "local" ]]; then
+            if [[ -n "$lines" ]]; then
+                captured="$(local_capture_pane --pane="$pane_target" --lines="$lines")"
+            else
+                captured="$(local_capture_pane --pane="$pane_target")"
+            fi
+        else
+            if [[ -n "$lines" ]]; then
+                captured="$(remote_capture_pane --pane="$pane_target" --lines="$lines")"
+            else
+                captured="$(remote_capture_pane --pane="$pane_target")"
+            fi
+        fi
+
+        find_markers_in_output "$captured" "$start_marker" "$end_marker"
+        if [[ $HAS_START -eq 1 || -z "$lines" ]]; then
+            break
+        fi
+    done
+
+    parse_marked_output "$captured" "$start_marker" "$end_marker"
+}
+
+# ---------------------------------------------------------------------------
+# CLI Commands
+# ---------------------------------------------------------------------------
+
+cmd_status() {
+    if [[ "$MODE" == "remote" ]]; then
+        echo "Not currently in tmux"
+        echo "Remote session: ${SESSION_NAME}"
+        return
+    fi
+
+    local tmux_pane="${TMUX_PANE:-}"
+    local session window pane_index
+
+    if [[ -n "$tmux_pane" ]]; then
+        run_tmux display-message -t "$tmux_pane" -p '#{session_name}'
+        session="$TMUX_OUT"; local sc=$TMUX_RC
+        run_tmux display-message -t "$tmux_pane" -p '#{window_name}'
+        window="$TMUX_OUT"; local wc=$TMUX_RC
+        run_tmux display-message -t "$tmux_pane" -p '#{pane_index}'
+        pane_index="$TMUX_OUT"; local pc=$TMUX_RC
+
+        if [[ $sc -ne 0 || $wc -ne 0 || $pc -ne 0 ]]; then
+            session="" ; window="" ; pane_index=""
+        fi
+    else
+        session="$(local_get_current_session)" || session=""
+        window="$(local_get_current_window)" || window=""
+        pane_index="$(local_get_current_pane_index)" || pane_index=""
+    fi
+
+    if [[ -n "$session" && -n "$window" && -n "$pane_index" ]]; then
+        echo "Current location: ${session}:${window}.${pane_index}"
+    else
+        echo "Could not determine current tmux location"
+    fi
+
+    # List panes
+    local panes_json
+    panes_json="$(local_list_panes)"
+    if [[ "$panes_json" != "[]" ]]; then
+        echo ""
+        echo "Panes in current window:"
+        # Parse minimal JSON to display table
+        # Use python if available, otherwise a simple approach
+        if command -v python3 &>/dev/null; then
+            python3 -c "
+import json, sys
+panes = json.loads(sys.stdin.read())
+for p in panes:
+    marker = ' *' if p['active'] else '  '
+    cmd = p.get('command', '')
+    title = p.get('title', '')
+    print(f'{marker} {p[\"formatted_id\"]:15} {cmd:20} {title}')
+" <<< "$panes_json"
+        else
+            echo "$panes_json"
+        fi
+    else
+        echo ""
+        echo "No panes found"
+    fi
+}
+
+cmd_list_panes() {
+    if [[ "$MODE" == "local" ]]; then
+        local_list_panes
+    else
+        remote_list_panes
+    fi
+}
+
+cmd_launch() {
+    local command="" vertical=1 size=50 name=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --vertical)     vertical=1; shift ;;
+            --horizontal)   vertical=0; shift ;;
+            --size=*)       size="${1#--size=}"; shift ;;
+            --name=*)       name="${1#--name=}"; shift ;;
+            *)              if [[ -z "$command" ]]; then command="$1"; fi; shift ;;
+        esac
+    done
+
+    if [[ "$MODE" == "local" ]]; then
+        local args=()
+        [[ $vertical -eq 1 ]] && args+=("--vertical") || args+=("--horizontal")
+        args+=("--size=$size")
+        [[ -n "$command" ]] && args+=("$command")
+
+        local pane_id
+        pane_id="$(local_launch_cli "${args[@]}")" || { echo "Failed to launch" >&2; return 1; }
+        echo "Launched '${command}' in pane ${pane_id}"
+    else
+        local args=()
+        [[ -n "$name" ]] && args+=("--name=$name")
+        [[ -n "$command" ]] && args+=("$command")
+
+        local pane_id
+        pane_id="$(remote_launch_cli "${args[@]}")" || { echo "Failed to launch" >&2; return 1; }
+        echo "Launched '${command}' in window: ${pane_id}"
+    fi
+}
+
+cmd_send() {
+    local text="" pane="" enter="True" delay_enter="True"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --pane=*)         pane="${1#--pane=}"; shift ;;
+            --enter=*)        enter="${1#--enter=}"; shift ;;
+            --delay-enter=*|--delay_enter=*)
+                              delay_enter="${1#*=}"; shift ;;
+            *)                if [[ -z "$text" ]]; then text="$1"; fi; shift ;;
+        esac
+    done
+
+    if [[ "$MODE" == "local" ]]; then
+        if [[ -n "$pane" ]]; then
+            local resolved
+            resolved="$(local_resolve_pane "$pane")" || {
+                echo "Could not resolve pane identifier: $pane"
+                return 1
+            }
+            TARGET_PANE="$resolved"
+        fi
+        local_send_keys "$text" --enter="$enter" --delay-enter="$delay_enter"
+    else
+        remote_send_keys "$text" --pane="$pane" --enter="$enter" --delay-enter="$delay_enter"
+    fi
+    echo "Text sent"
+}
+
+cmd_capture() {
+    local pane="" lines=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --pane=*)  pane="${1#--pane=}"; shift ;;
+            --lines=*) lines="${1#--lines=}"; shift ;;
+            *)         shift ;;
+        esac
+    done
+
+    if [[ "$MODE" == "local" ]]; then
+        if [[ -n "$pane" ]]; then
+            local resolved
+            resolved="$(local_resolve_pane "$pane")" || {
+                echo "Could not resolve pane identifier: $pane"
+                return 1
+            }
+            TARGET_PANE="$resolved"
+        fi
+        local args=()
+        [[ -n "$lines" ]] && args+=(--lines="$lines")
+        local_capture_pane "${args[@]}"
+        echo ""  # trailing newline
+    else
+        local args=(--pane="$pane")
+        [[ -n "$lines" ]] && args+=(--lines="$lines")
+        remote_capture_pane "${args[@]}"
+        echo ""  # trailing newline
+    fi
+}
+
+cmd_execute() {
+    local command="" pane="" timeout=30
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --pane=*)    pane="${1#--pane=}"; shift ;;
+            --timeout=*) timeout="${1#--timeout=}"; shift ;;
+            *)           if [[ -z "$command" ]]; then command="$1"; fi; shift ;;
+        esac
+    done
+
+    if [[ "$MODE" == "local" ]]; then
+        if [[ -n "$pane" ]]; then
+            local resolved
+            resolved="$(local_resolve_pane "$pane")" || {
+                echo "Could not resolve pane identifier: $pane"
+                return 1
+            }
+            local_execute "$command" --pane="$resolved" --timeout="$timeout"
+        else
+            local_execute "$command" --timeout="$timeout"
+        fi
+    else
+        remote_execute "$command" --pane="$pane" --timeout="$timeout"
+    fi
+}
+
+cmd_interrupt() {
+    local pane=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in --pane=*) pane="${1#--pane=}"; shift ;; *) shift ;; esac
+    done
+
+    if [[ "$MODE" == "local" ]]; then
+        if [[ -n "$pane" ]]; then
+            local resolved
+            resolved="$(local_resolve_pane "$pane")" || {
+                echo "Could not resolve pane identifier: $pane"
+                return 1
+            }
+            TARGET_PANE="$resolved"
+        fi
+        # shellcheck disable=SC2119
+        local_send_interrupt
+    else
+        remote_send_interrupt --pane="$pane"
+    fi
+    echo "Sent interrupt signal"
+}
+
+cmd_escape() {
+    local pane=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in --pane=*) pane="${1#--pane=}"; shift ;; *) shift ;; esac
+    done
+
+    if [[ "$MODE" == "local" ]]; then
+        if [[ -n "$pane" ]]; then
+            local resolved
+            resolved="$(local_resolve_pane "$pane")" || {
+                echo "Could not resolve pane identifier: $pane"
+                return 1
+            }
+            TARGET_PANE="$resolved"
+        fi
+        # shellcheck disable=SC2119
+        local_send_escape
+    else
+        remote_send_escape --pane="$pane"
+    fi
+    echo "Sent escape key"
+}
+
+cmd_kill() {
+    local pane=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in --pane=*) pane="${1#--pane=}"; shift ;; *) shift ;; esac
+    done
+
+    if [[ "$MODE" == "local" ]]; then
+        if [[ -n "$pane" ]]; then
+            local resolved
+            resolved="$(local_resolve_pane "$pane")" || {
+                echo "Could not resolve pane identifier: $pane"
+                return 1
+            }
+            TARGET_PANE="$resolved"
+        fi
+        # shellcheck disable=SC2119
+        local_kill_pane && echo "Pane killed" || return 1
+    else
+        remote_kill_window --pane="$pane"
+        echo "Window killed"
+    fi
+}
+
+cmd_wait_idle() {
+    local pane="" idle_time="2.0" timeout=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --pane=*)           pane="${1#--pane=}"; shift ;;
+            --idle-time=*|--idle_time=*)
+                                idle_time="${1#*=}"; shift ;;
+            --timeout=*)        timeout="${1#--timeout=}"; shift ;;
+            *)                  shift ;;
+        esac
+    done
+
+    echo "Waiting for pane to become idle (no changes for ${idle_time}s)..."
+
+    local args=()
+    [[ -n "$idle_time" ]] && args+=(--idle-time="$idle_time")
+    [[ -n "$timeout" ]] && args+=(--timeout="$timeout")
+
+    if [[ "$MODE" == "local" ]]; then
+        if [[ -n "$pane" ]]; then
+            local resolved
+            resolved="$(local_resolve_pane "$pane")" || {
+                echo "Could not resolve pane identifier: $pane"
+                return 1
+            }
+            TARGET_PANE="$resolved"
+        fi
+        if local_wait_for_idle "${args[@]}"; then
+            echo "Pane is idle"
+        else
+            echo "Timeout waiting for idle"
+            return 1
+        fi
+    else
+        args+=(--pane="$pane")
+        if remote_wait_for_idle "${args[@]}"; then
+            echo "Pane is idle"
+        else
+            echo "Timeout waiting for idle"
+            return 1
+        fi
+    fi
+}
+
+cmd_resize() {
+    if [[ "$MODE" != "local" ]]; then
+        echo "Resize is only available in local mode (inside tmux)"
+        return 1
+    fi
+
+    local pane="" direction="" amount=5
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --pane=*)      pane="${1#--pane=}"; shift ;;
+            --direction=*) direction="${1#--direction=}"; shift ;;
+            --amount=*)    amount="${1#--amount=}"; shift ;;
+            *)             shift ;;
+        esac
+    done
+
+    if [[ -n "$pane" ]]; then
+        local resolved
+        resolved="$(local_resolve_pane "$pane")" || {
+            echo "Could not resolve pane identifier: $pane"
+            return 1
+        }
+        TARGET_PANE="$resolved"
+    fi
+    local_resize_pane --direction="$direction" --amount="$amount"
+    echo "Pane resized"
+}
+
+cmd_focus() {
+    if [[ "$MODE" != "local" ]]; then
+        echo "Focus is only available in local mode (inside tmux)"
+        return 1
+    fi
+
+    local pane=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in --pane=*) pane="${1#--pane=}"; shift ;; *) shift ;; esac
+    done
+
+    if [[ -n "$pane" ]]; then
+        local resolved
+        resolved="$(local_resolve_pane "$pane")" || {
+            echo "Could not resolve pane identifier: $pane"
+            return 1
+        }
+        TARGET_PANE="$resolved"
+    fi
+    # shellcheck disable=SC2119
+    local_focus_pane
+    echo "Pane focused"
+}
+
+cmd_clear() {
+    if [[ "$MODE" != "local" ]]; then
+        echo "Clear is only available in local mode (inside tmux)"
+        return 1
+    fi
+
+    local pane=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in --pane=*) pane="${1#--pane=}"; shift ;; *) shift ;; esac
+    done
+
+    if [[ -n "$pane" ]]; then
+        local resolved
+        resolved="$(local_resolve_pane "$pane")" || {
+            echo "Could not resolve pane identifier: $pane"
+            return 1
+        }
+        TARGET_PANE="$resolved"
+    fi
+    # shellcheck disable=SC2119
+    local_clear_pane
+    echo "Pane cleared"
+}
+
+cmd_wait_for_prompt() {
+    if [[ "$MODE" != "local" ]]; then
+        echo "Wait_for_prompt is only available in local mode (inside tmux)"
+        return 1
+    fi
+
+    local pane="" pattern="" timeout=10 interval="0.5" lines=50
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --pane=*)     pane="${1#--pane=}"; shift ;;
+            --timeout=*)  timeout="${1#--timeout=}"; shift ;;
+            --interval=*) interval="${1#--interval=}"; shift ;;
+            --lines=*)    lines="${1#--lines=}"; shift ;;
+            *)            if [[ -z "$pattern" ]]; then pattern="$1"; fi; shift ;;
+        esac
+    done
+
+    [[ -z "$pattern" ]] && echo "Error: No prompt pattern specified" >&2 && return 1
+
+    echo "Waiting for prompt matching '${pattern}'..."
+
+    if [[ -n "$pane" ]]; then
+        local resolved
+        resolved="$(local_resolve_pane "$pane")" || {
+            echo "Could not resolve pane identifier: $pane"
+            return 1
+        }
+        TARGET_PANE="$resolved"
+    fi
+    if local_wait_for_prompt "$pattern" --timeout="$timeout" --interval="$interval" --lines="$lines"; then
+        echo "Prompt detected"
+    else
+        echo "Timeout waiting for prompt"
+        return 1
+    fi
+}
+
+cmd_attach() {
+    if [[ "$MODE" == "local" ]]; then
+        echo "Attach is only available in remote mode (when outside tmux)"
+        return
+    fi
+    remote_attach_session
+}
+
+cmd_cleanup() {
+    if [[ "$MODE" == "local" ]]; then
+        echo "Cleanup is only available in remote mode (when outside tmux)"
+        return
+    fi
+    remote_cleanup_session
+}
+
+cmd_list_windows() {
+    if [[ "$MODE" == "local" ]]; then
+        echo "List_windows is only available in remote mode. Use list_panes instead."
+        return
+    fi
+
+    remote_ensure_session
+    echo "Windows in session '${SESSION_NAME}':"
+    remote_list_windows
+}
+
+cmd_help() {
+    if [[ "$MODE" == "local" ]]; then
+        echo "CURRENT TMUX STATUS:"
+        echo "============================================================"
+        cmd_status
+        echo "============================================================"
+        echo ""
+    fi
+
+    local mode_label
+    if [[ "$MODE" == "local" ]]; then
+        mode_label="MODE: LOCAL (inside tmux) - Managing panes in current window"
+    else
+        mode_label="MODE: REMOTE (outside tmux) - Managing windows in session '${SESSION_NAME}'"
+    fi
+
+    cat << 'HELPEOF'
+TMUX-CLI HELP
+============================================================
+HELPEOF
+    echo "$mode_label"
+    cat << 'HELPEOF'
+============================================================
+
+# tmux-cli Usage
+
+## Commands
+
+  status          Show current tmux status and pane information
+  list_panes      List all panes in current window (JSON)
+  launch CMD      Launch a command in a new pane/window
+  send TEXT       Send text to a pane
+  capture         Capture and print pane content
+  execute CMD     Execute command and return JSON with exit code
+  wait_idle       Wait for pane to become idle
+  interrupt       Send Ctrl+C to a pane
+  escape          Send Escape key to a pane
+  kill            Kill a pane/window
+  resize          Resize a pane (local mode only)
+  focus           Focus/select a pane (local mode only)
+  clear           Clear pane screen via Ctrl+L (local mode only)
+  wait_for_prompt Wait for regex pattern in pane output (local mode only)
+  help            Show this help message
+
+## Common Options
+
+  --pane=ID       Target pane identifier
+  --enter=BOOL    Send Enter after text (default: True)
+  --delay-enter=VAL  Delay before Enter: True (1.5s), False (0s), or float
+  --timeout=SEC   Timeout in seconds (for execute, wait_idle, wait_for_prompt)
+  --lines=N       Number of lines to capture
+  --direction=DIR Resize direction: up, down, left, right
+  --amount=N      Resize amount in cells (default: 5)
+  --interval=SEC  Check interval for wait_for_prompt (default: 0.5)
+
+## Pane Identifiers
+
+  2               Pane index 2 in current window
+  myapp:1.2       session:window.pane format
+  %12             Pane ID
+
+## Examples
+
+  tmux-cli launch "python3"
+  tmux-cli send "print('hello')" --pane=1
+  tmux-cli capture --pane=1
+  tmux-cli execute "make test" --pane=1
+  tmux-cli wait_idle --pane=1
+  tmux-cli kill --pane=1
+HELPEOF
+
+    if [[ "$MODE" == "remote" ]]; then
+        cat << 'HELPEOF'
+
+============================================================
+REMOTE MODE SPECIFIC COMMANDS:
+- tmux-cli attach: Attach to the managed session to view live
+- tmux-cli cleanup: Kill the entire managed session
+- tmux-cli list_windows: List all windows in the session
+
+Note: In remote mode, 'panes' are actually windows for better isolation.
+============================================================
+HELPEOF
+    else
+        cat << 'HELPEOF'
+
+============================================================
+LOCAL MODE PANE IDENTIFIERS:
+- session:window.pane format (e.g., 'cc-tools:1.2')
+- Pane IDs (e.g., '%12') for backwards compatibility
+- Just pane index (e.g., '2') for current window
+============================================================
+HELPEOF
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+main() {
+    local subcmd="${1:-help}"
+    shift 2>/dev/null || true
+
+    # Handle --help anywhere
+    if [[ "$subcmd" == "--help" || "$subcmd" == "-h" ]]; then
+        subcmd="help"
+    fi
+
+    detect_mode
+
+    case "$subcmd" in
+        status)       cmd_status "$@" ;;
+        list_panes)   cmd_list_panes "$@" ;;
+        launch)       cmd_launch "$@" ;;
+        send)         cmd_send "$@" ;;
+        capture)      cmd_capture "$@" ;;
+        execute)      cmd_execute "$@" ;;
+        interrupt)    cmd_interrupt "$@" ;;
+        escape)       cmd_escape "$@" ;;
+        kill)         cmd_kill "$@" ;;
+        wait_idle)    cmd_wait_idle "$@" ;;
+        resize)       cmd_resize "$@" ;;
+        focus)        cmd_focus "$@" ;;
+        clear)        cmd_clear "$@" ;;
+        wait_for_prompt) cmd_wait_for_prompt "$@" ;;
+        attach)       cmd_attach "$@" ;;
+        cleanup)      cmd_cleanup "$@" ;;
+        list_windows) cmd_list_windows "$@" ;;
+        help)         cmd_help "$@" ;;
+        *)
+            echo "Error: Unknown command: $subcmd" >&2
+            echo "Run 'tmux-cli help' for usage information." >&2
+            return 1
+            ;;
+    esac
+}
+
+# Only run main when executed directly (not sourced for testing)
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

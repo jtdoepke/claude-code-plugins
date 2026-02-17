@@ -14,6 +14,11 @@
       "name": "code-review",
       "source": "./plugins/code-review",
       "description": "Multi-agent code review for GitHub PRs, GitLab MRs, and local git changes"
+    },
+    {
+      "name": "tmux-cli",
+      "source": "./plugins/tmux-cli",
+      "description": "Interact with CLI scripts or other code-agents in tmux panes via a self-contained bash script"
     }
   ]
 }

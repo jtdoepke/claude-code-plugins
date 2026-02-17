@@ -1,0 +1,12 @@
+[submodule "plugins/obsidian-skills/tests/lib/bats-support"]
+	path = plugins/obsidian-skills/tests/lib/bats-support
+	url = https://github.com/bats-core/bats-support.git
+[submodule "plugins/obsidian-skills/tests/lib/bats-assert"]
+	path = plugins/obsidian-skills/tests/lib/bats-assert
+	url = https://github.com/bats-core/bats-assert.git
+[submodule "plugins/tmux-cli/tests/lib/bats-support"]
+	path = plugins/tmux-cli/tests/lib/bats-support
+	url = https://github.com/bats-core/bats-support.git
+[submodule "plugins/tmux-cli/tests/lib/bats-assert"]
+	path = plugins/tmux-cli/tests/lib/bats-assert
+	url = https://github.com/bats-core/bats-assert.git

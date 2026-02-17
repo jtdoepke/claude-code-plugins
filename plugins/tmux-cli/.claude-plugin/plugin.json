@@ -1,0 +1,8 @@
+{
+  "name": "tmux-cli",
+  "version": "0.1.0",
+  "description": "Interact with CLI scripts and code agents in tmux panes",
+  "author": {
+    "name": "Jaye Doepke"
+  }
+}
